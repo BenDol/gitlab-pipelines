@@ -42,8 +42,8 @@ BRANCHES = {
   "4241428": ["2.0-SNAPSHOT", "1.0-SNAPSHOT"]
 }
 
-def execute_after_delay(seconds, my_event):
-  timer = threading.Timer(seconds, my_event)
+def execute_after_delay(seconds, my_event, *args, **kwargs):
+  timer = threading.Timer(seconds, my_event, args=args, kwargs=kwargs)
   timer.start()
   return timer
 
@@ -440,7 +440,7 @@ class PipelineCheckerApp(tk.Tk):
           "end",
           text=text,
           image=icon,
-          values=(pid, "project", pstatus, pweb, pref, pipeline),
+          values=(pid, "project", pstatus, pweb, pref, pipeline, pname),
           tags=(tag,)
         )
 
@@ -887,10 +887,13 @@ class PipelineCheckerApp(tk.Tk):
     if len(row_values) < 5:
       messagebox.showerror("Error", "Cannot retry pipeline: not enough info stored.")
       return
+    
+    row_text = self.tree.item(row_id, "text")
 
     project_id = row_values[0]
     node_type = row_values[1]
     pipeline_id = row_values[5]
+    project_name = row_values[6]
 
     if node_type != "project":
       messagebox.showinfo("Not a Project", "This menu action only applies to projects.")
@@ -898,11 +901,13 @@ class PipelineCheckerApp(tk.Tk):
 
     # Here use a helper function to call GitLab's /retry endpoint
     try:
-      debug(f"Retrying pipeline {pipeline_id} for project {project_id}.")
+      debug(f"Retrying pipeline {pipeline_id} for project {project_name} ({project_id}).")
       info = self.retry_pipeline(self.token_var.get(), project_id, pipeline_id)
       #debug(f"Retry info: {info}")
       messagebox.showinfo("Retry Successful",
-        f"Pipeline {pipeline_id} for project {project_id} was retried.")
+        f"Pipeline {pipeline_id} for project '{project_name}' was retried.")
+      
+      execute_after_delay(3, self.refresh_project, row_id)
     except Exception as e:
       messagebox.showerror("Error", str(e))
   
