@@ -43,7 +43,7 @@ def debug(msg):
 
 GITLAB_API_URL = settings.get("gitlab_api_url", "https://gitlab.com/api/v4")
 GROUP_NAME = settings.get("group_name", "insurance-insight")
-CACHE_FILE = "cached_tree.json"
+CACHE_FILE = "cache.json"
 CACHE_REFRESH_SECONDS = settings.get("cache_refresh_seconds", 60 * 5)
 IGNORED_GROUPS = settings.get("ignored_groups", [
   "10926345",
