@@ -106,7 +106,7 @@ class PipelineCheckerApp(tk.Tk):
 
       try:
         debug("Loading failed.png.")
-        failed_raw = Image.open("assets/imagesfailed.png")
+        failed_raw = Image.open("assets/images/failed.png")
         if RESAMPLE:
           failed_raw = failed_raw.resize((20, 20), RESAMPLE)
         else:
@@ -117,7 +117,7 @@ class PipelineCheckerApp(tk.Tk):
 
       try:
         debug("Loading skipped.png.")
-        skipped_raw = Image.open("assets/imagesskipped.png")
+        skipped_raw = Image.open("assets/images/skipped.png")
         if RESAMPLE:
           skipped_raw = skipped_raw.resize((20, 20), RESAMPLE)
         else:
