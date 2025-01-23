@@ -63,7 +63,8 @@ class PipelineCheckerApp(tk.Tk):
     super().__init__()
     self.title("GitLab Pipelines")
     self.iconbitmap("assets/images/logo.ico") 
-    self.minsize(width=690, height=820)
+    self.minsize(width=690, height=200)
+    self.geometry("690x820")
 
     # Debug print
     debug("Initializing main app window.")
