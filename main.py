@@ -2,11 +2,11 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import requests
 import os
-import json
-import pathlib
-import threading
 import time
+import json
+import threading
 import webbrowser
+import trayapp
 
 # If you need image scaling, install Pillow (pip install pillow).
 try:
@@ -19,14 +19,25 @@ except ImportError:
   ImageTk = None
   RESAMPLE = None
 
-DEBUG_ENABLED = True
+def load_json(file):
+  if not file.endswith(".json"):
+    file += ".json"
+  f = open(os.getcwd() + '/' + file, )
+  conf = json.load(f)
+  f.close()
+  return conf
+
+settings = load_json("settings.json")
+
+DEBUG_ENABLED = settings.get("debug", False)
 def debug(msg):
   if DEBUG_ENABLED:
     print(f"[DEBUG] {msg}")
 
-GITLAB_API_URL = "https://gitlab.com/api/v4"
-GROUP_NAME = "insurance-insight"
+GITLAB_API_URL = settings.get("gitlab_api_url", "https://gitlab.com/api/v4")
+GROUP_NAME = settings.get("group_name", "insurance-insight")
 CACHE_FILE = "cached_tree.json"
+CACHE_REFRESH_SECONDS = settings.get("cache_refresh_seconds", 60 * 5)
 BRANCHES = {
   "4241428": ["2.0-SNAPSHOT", "1.0-SNAPSHOT"]
 }
@@ -39,7 +50,8 @@ def execute_after_delay(seconds, my_event):
 class PipelineCheckerApp(tk.Tk):
   def __init__(self):
     super().__init__()
-    self.title("GitLab Groups & Pipelines")
+    self.title("GitLab Pipelines")
+    self.iconbitmap("assets/images/logo.ico") 
     self.minsize(width=690, height=820)
 
     # Debug print
@@ -65,11 +77,7 @@ class PipelineCheckerApp(tk.Tk):
     load_button = ttk.Button(input_frame, text="Reset Groups", command=self.load_root_group)
     load_button.pack(side="left", padx=5)
 
-    # Button to save tree to JSON
-    #save_button = ttk.Button(input_frame, text="Save Tree to JSON", command=self.save_tree_to_json)
-    #save_button.pack(side="left", padx=5)
-
-    refresh_button = ttk.Button(input_frame, text="Refresh", command=self.refresh_open_groups)
+    refresh_button = ttk.Button(input_frame, text="Refresh", command=self.refresh_groups)
     refresh_button.pack(side="left", padx=5)
 
     # Tree frame
@@ -138,11 +146,14 @@ class PipelineCheckerApp(tk.Tk):
     # Check for cached JSON at startup
     if os.path.exists(CACHE_FILE):
       debug("Cached tree file found. Loading from JSON...")
-      if not self.load_tree_from_json(CACHE_FILE):
-        self.load_root_group()
+      mtime = os.path.getmtime(CACHE_FILE)
+      age_in_seconds = time.time() - mtime
+      if self.load_tree_from_json(CACHE_FILE):
+        debug(f"age_in_seconds: {age_in_seconds}")
+        if age_in_seconds >= CACHE_REFRESH_SECONDS:
+          self.refresh_groups()
       else:
-        # After loading, refresh any group that was open
-        self.refresh_open_groups()
+        self.load_root_group()
     else:
       # If no cache, load root group from GitLab
       self.load_root_group()
@@ -209,13 +220,16 @@ class PipelineCheckerApp(tk.Tk):
     item_id = self.tree.focus()
     vals = self.tree.item(item_id, "values")
     if len(vals) < 3:
-      debug("Node has insufficient values to process.")
+      debug(f"on_tree_open: Node has insufficient values to process. ({vals})")
       return
     node_type = vals[1]
     status_flag = vals[2]
     if node_type == "group":
       if status_flag == "unfetched":
-        debug("Expanding a group node that hasn't been fetched yet.")
+        debug(f"Expanding a group node that hasn't been fetched yet ({item_id}).")
+        self.fetch_subgroups_and_projects(item_id, vals[0])
+      elif status_flag == "refresh":
+        debug("Refreshing a group node.")
         self.refresh_all_project_pipelines_below(item_id)
 
       execute_after_delay(0.05, self.save_tree_to_json)
@@ -441,8 +455,9 @@ class PipelineCheckerApp(tk.Tk):
   def refresh_project(self, item_id):
     """Refresh the clicked project node."""
     values = self.tree.item(item_id, "values")
-    if len(values) < 6:
+    if len(values) < 4:
       # Not enough data (id, type, status, web_url, branch, pipeline_id)
+      debug(f"refresh_project: Node {item_id} has insufficient values to process. ({values})")
       return
 
     node_id = values[0]
@@ -506,18 +521,19 @@ class PipelineCheckerApp(tk.Tk):
     # Mark it as 'fetched' now
     self.tree.item(parent_id, values=tuple(old_vals))
 
+    debug(f"refresh_all_project_pipelines_below: {parent_id} ({len(children)}) ({old_vals})")
+
     for child_id in children:
       values = self.tree.item(child_id, "values")
-      if len(values) < 6:
+      if len(values) < 4:
+        debug(f"Node {child_id} has insufficient values to process. ({values})")
         continue
 
-      node_id = values[0]
       node_type = values[1]
       if node_type == "project":
         self.refresh_project(child_id)
       elif node_type == "group":
-        debug(f"Refreshing a group node {node_id}, not a project.")
-        # Recurse down into this group?s children
+        debug(f"Refreshing a group node {child_id}")
         self.refresh_all_project_pipelines_below(child_id)
 
   def get_parent_group_id(self, item_id):
@@ -669,16 +685,21 @@ class PipelineCheckerApp(tk.Tk):
     for child_data in children:
       self.insert_node_from_dict(item_id, child_data)
 
-  def refresh_open_groups(self):
+  def refresh_groups(self):
     """
     After loading from JSON, this method finds all group nodes that
     are 'open' and re-fetches them from GitLab, so the 'currently
     showing' projects are refreshed.
     """
     debug("Refreshing open group nodes from GitLab...")
+    self.loading_label.config(text="Refreshing groups...")
+    self.update_idletasks()
     root_items = self.tree.get_children("")
     for item_id in root_items:
+      debug(f"refresh_groups: Refreshing {item_id}")
       self.refresh_group(item_id)
+
+    self.loading_label.config(text="")
 
   def refresh_group(self, item_id):
     """Recursively refresh this group if it is open, then check children."""
@@ -697,16 +718,11 @@ class PipelineCheckerApp(tk.Tk):
       if not children or len(children) == 0:
         self.tree.insert(item_id, "end", text="Loading...")
       elif bool(is_open):
-        # After refreshing, get children and see if any sub-groups are also open
-        for child_id in children:
-          self.refresh_group(child_id)
-
-        # 3) Refresh project pipelines under this group
         self.refresh_all_project_pipelines_below(item_id)
       else:
-        vals[2] = "unfetched"
+        vals[2] = "refresh"
         self.tree.item(item_id, values=tuple(vals))
-    else:      
+    else:
       # If it's not an open group, just recurse to children
       # (In case you have subgroups under projects, typically not, but just in case)
       for child_id in self.tree.get_children(item_id):
@@ -928,10 +944,16 @@ class PipelineCheckerApp(tk.Tk):
     row_values = self.tree.item(row_id, "values")
     if len(row_values) < 2:
       return
+    
+    row_text = self.tree.item(row_id, "text")
+    self.loading_label.config(text=f"Refreshing {row_text}...")
+    self.update_idletasks()
 
     node_type = row_values[1]
     if node_type == "group":
       self.refresh_group(row_id)
+
+    self.loading_label.config(text="")
 
   def menu_refresh_project(self):
     """Refresh the clicked project node."""
@@ -943,12 +965,18 @@ class PipelineCheckerApp(tk.Tk):
     if len(row_values) < 2:
       return
 
+    row_text = self.tree.item(row_id, "text")
+    self.loading_label.config(text=f"Refreshing {row_text}...")
+    self.update_idletasks()
+
     node_type = row_values[1]
     if node_type == "project":
       self.refresh_project(row_id)
 
+    self.loading_label.config(text="")
+
 # -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-  app = PipelineCheckerApp()
-  app.mainloop()
+  app = trayapp.TrayApp(PipelineCheckerApp())
+  app.run()
