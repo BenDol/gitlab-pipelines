@@ -7,6 +7,7 @@ import json
 import threading
 import webbrowser
 import trayapp
+import winreg
 
 # If you need image scaling, install Pillow (pip install pillow).
 try:
@@ -18,6 +19,12 @@ except ImportError:
   Image = None
   ImageTk = None
   RESAMPLE = None
+
+def set_env_var(name, value, system=False):
+  scope = winreg.HKEY_CURRENT_USER if not system else winreg.HKEY_LOCAL_MACHINE
+  sub_key = r'Environment'
+  with winreg.OpenKey(scope, sub_key, 0, winreg.KEY_SET_VALUE) as key:
+    winreg.SetValueEx(key, name, 0, winreg.REG_EXPAND_SZ, value)
 
 def load_json(file):
   if not file.endswith(".json"):
@@ -38,6 +45,10 @@ GITLAB_API_URL = settings.get("gitlab_api_url", "https://gitlab.com/api/v4")
 GROUP_NAME = settings.get("group_name", "insurance-insight")
 CACHE_FILE = "cached_tree.json"
 CACHE_REFRESH_SECONDS = settings.get("cache_refresh_seconds", 60 * 5)
+IGNORED_GROUPS = settings.get("ignored_groups", [
+  "10926345",
+  "6622675"
+])
 BRANCHES = {
   "4241428": ["2.0-SNAPSHOT", "1.0-SNAPSHOT"]
 }
@@ -72,6 +83,7 @@ class PipelineCheckerApp(tk.Tk):
 
     ttk.Label(input_frame, text="Personal Access Token:").pack(side="left")
     self.token_entry = ttk.Entry(input_frame, textvariable=self.token_var, width=50, show="*")
+    self.token_entry.bind("<Return>", lambda e: self.on_token_enterkey())
     self.token_entry.pack(side="left", padx=5)
 
     load_button = ttk.Button(input_frame, text="Reset Groups", command=self.load_root_group)
@@ -151,7 +163,7 @@ class PipelineCheckerApp(tk.Tk):
       if self.load_tree_from_json(CACHE_FILE):
         debug(f"age_in_seconds: {age_in_seconds}")
         if age_in_seconds >= CACHE_REFRESH_SECONDS:
-          self.refresh_groups()
+          self.refresh_groups(save_json=False)
       else:
         self.load_root_group()
     else:
@@ -175,6 +187,18 @@ class PipelineCheckerApp(tk.Tk):
   # -------------------------------------------------------------------------
   #  Core functionalities
   # -------------------------------------------------------------------------
+
+  def on_token_enterkey(self):
+    """Handler for pressing Enter in the token entry field."""
+    if self.token_var:
+      token = self.token_var.get().strip()
+      if token:
+        debug("Token entered. Loading root group.")
+        set_env_var('GITLAB_TOKEN', token)
+        self.load_root_group()
+        return
+
+    messagebox.showerror("Error", "Please provide a valid token.")
 
   def load_root_group(self):
     """Fetch the root group from GitLab and populate the tree."""
@@ -352,13 +376,15 @@ class PipelineCheckerApp(tk.Tk):
     # Define priority so failed/canceled appear first
     def get_priority(status: str):
       ps_lower = status.lower()
-      if ps_lower in ("failed", "canceled"):
+      if ps_lower in ("running", "pending"):
         return 0
-      elif ps_lower in ("success", "manual"):
+      elif ps_lower in ("failed", "canceled"):
         return 1
-      else:
-        # for "skipped", "running", "pending", etc.
+      elif ps_lower in ("success", "manual"):
         return 2
+      else:
+        # for "skipped", etc.
+        return 3
 
     # Sort by priority
     projects_with_status.sort(key=lambda x: get_priority(x[1]))
@@ -394,6 +420,9 @@ class PipelineCheckerApp(tk.Tk):
       # --------------------------------------------------------------------
       for sg in subgroups:
         sid = sg["id"]
+        if str(sid) in IGNORED_GROUPS:
+          debug(f"Ignoring group {sid}.")
+          continue
         sname = sg["full_name"]
         sweb = sg.get("web_url", "")
         node_id = self.tree.insert(
@@ -452,7 +481,7 @@ class PipelineCheckerApp(tk.Tk):
       # Hide loading label
       self.loading_label.config(text="")
 
-  def refresh_project(self, item_id):
+  def refresh_project(self, item_id, save_json=False):
     """Refresh the clicked project node."""
     values = self.tree.item(item_id, "values")
     if len(values) < 4:
@@ -505,8 +534,11 @@ class PipelineCheckerApp(tk.Tk):
         text=new_text,
         image=icon,
         tags=(tag,),
-        values=(node_id, "project", pstatus, pweb, pref, pipeline_id)
+        values=(node_id, "project", pstatus, pweb, pref, pipeline_id, pname_clean)
       )
+      
+    if save_json:
+      execute_after_delay(0.05, self.save_tree_to_json)
 
   def refresh_all_project_pipelines_below(self, parent_id):
     """
@@ -685,7 +717,7 @@ class PipelineCheckerApp(tk.Tk):
     for child_data in children:
       self.insert_node_from_dict(item_id, child_data)
 
-  def refresh_groups(self):
+  def refresh_groups(self, save_json=True):
     """
     After loading from JSON, this method finds all group nodes that
     are 'open' and re-fetches them from GitLab, so the 'currently
@@ -700,8 +732,10 @@ class PipelineCheckerApp(tk.Tk):
       self.refresh_group(item_id)
 
     self.loading_label.config(text="")
+    if save_json:
+      execute_after_delay(0.05, self.save_tree_to_json)
 
-  def refresh_group(self, item_id):
+  def refresh_group(self, item_id, save_json=False):
     """Recursively refresh this group if it is open, then check children."""
     is_open = self.tree.item(item_id, "open")
     text = self.tree.item(item_id, "text")
@@ -727,6 +761,9 @@ class PipelineCheckerApp(tk.Tk):
       # (In case you have subgroups under projects, typically not, but just in case)
       for child_id in self.tree.get_children(item_id):
         self.refresh_group(child_id)
+
+    if save_json:
+      execute_after_delay(0.05, self.save_tree_to_json)
 
   # -------------------------------------------------------------------------
   #  GitLab helpers
@@ -888,8 +925,6 @@ class PipelineCheckerApp(tk.Tk):
       messagebox.showerror("Error", "Cannot retry pipeline: not enough info stored.")
       return
     
-    row_text = self.tree.item(row_id, "text")
-
     project_id = row_values[0]
     node_type = row_values[1]
     pipeline_id = row_values[5]
@@ -907,7 +942,7 @@ class PipelineCheckerApp(tk.Tk):
       messagebox.showinfo("Retry Successful",
         f"Pipeline {pipeline_id} for project '{project_name}' was retried.")
       
-      execute_after_delay(3, self.refresh_project, row_id)
+      execute_after_delay(3, self.refresh_project, row_id, save_json=True)
     except Exception as e:
       messagebox.showerror("Error", str(e))
   
@@ -956,7 +991,7 @@ class PipelineCheckerApp(tk.Tk):
 
     node_type = row_values[1]
     if node_type == "group":
-      self.refresh_group(row_id)
+      self.refresh_group(row_id, save_json=True)
 
     self.loading_label.config(text="")
 
@@ -976,7 +1011,7 @@ class PipelineCheckerApp(tk.Tk):
 
     node_type = row_values[1]
     if node_type == "project":
-      self.refresh_project(row_id)
+      self.refresh_project(row_id, save_json=True)
 
     self.loading_label.config(text="")
 
