@@ -6,6 +6,7 @@ import json
 import pathlib
 import threading
 import time
+import webbrowser
 
 # If you need image scaling, install Pillow (pip install pillow).
 try:
@@ -26,6 +27,9 @@ def debug(msg):
 GITLAB_API_URL = "https://gitlab.com/api/v4"
 GROUP_NAME = "insurance-insight"
 CACHE_FILE = "cached_tree.json"
+BRANCHES = {
+  "4241428": ["2.0-SNAPSHOT", "1.0-SNAPSHOT"]
+}
 
 def execute_after_delay(seconds, my_event):
   timer = threading.Timer(seconds, my_event)
@@ -65,6 +69,9 @@ class PipelineCheckerApp(tk.Tk):
     #save_button = ttk.Button(input_frame, text="Save Tree to JSON", command=self.save_tree_to_json)
     #save_button.pack(side="left", padx=5)
 
+    refresh_button = ttk.Button(input_frame, text="Refresh", command=self.refresh_open_groups)
+    refresh_button.pack(side="left", padx=5)
+
     # Tree frame
     tree_frame = ttk.Frame(self)
     tree_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -78,10 +85,12 @@ class PipelineCheckerApp(tk.Tk):
 
     self.tree.bind("<<TreeviewOpen>>", self.on_tree_open)
     self.tree.bind("<<TreeviewClose>>", self.on_tree_close)
+    self.tree.bind("<Double-1>", self.on_tree_double_click)
+    self.tree.bind("<Button-3>", self.on_tree_right_click)
 
     # A label at the bottom to indicate "Loading..."
     self.loading_label = ttk.Label(self, text="", foreground="blue")
-    self.loading_label.pack(side="bottom", pady=5)
+    self.loading_label.pack(side="left", pady=5, padx=7)
 
     # Tags to color rows
     self.tree.tag_configure("success_tag", foreground="green")
@@ -138,6 +147,18 @@ class PipelineCheckerApp(tk.Tk):
       # If no cache, load root group from GitLab
       self.load_root_group()
 
+    # Create a Menu for right-click actions
+    self.group_menu = tk.Menu(self, tearoff=0)
+    self.group_menu.add_command(label="Refresh", command=self.menu_refresh_group)
+    self.group_menu.add_command(label="Open in Browser", command=self.menu_open_in_browser)
+
+    self.project_menu = tk.Menu(self, tearoff=0)
+    self.project_menu.add_command(label="Refresh", command=self.menu_refresh_project)
+    self.project_menu.add_command(label="Open in Browser", command=self.menu_open_in_browser)
+    self.project_menu.add_separator()
+    self.project_menu.add_command(label="Retry Pipeline", command=self.menu_retry_pipeline)
+    self.project_menu.add_command(label="Create Pipeline", command=self.menu_create_pipeline)
+
     self.loaded = True
 
   # -------------------------------------------------------------------------
@@ -166,7 +187,7 @@ class PipelineCheckerApp(tk.Tk):
         "",
         "end",
         text=f"Group: {GROUP_NAME}",
-        values=(gid, "group", "unfetched"),  # (id, type, fetched-status)
+        values=(gid, "group", "unfetched", ""),  # (id, type, fetched-status, web_url)
         open=False
       )
       # Dummy child so we can expand
@@ -195,7 +216,7 @@ class PipelineCheckerApp(tk.Tk):
     if node_type == "group":
       if status_flag == "unfetched":
         debug("Expanding a group node that hasn't been fetched yet.")
-        self.fetch_subgroups_and_projects(item_id, vals[0])
+        self.refresh_all_project_pipelines_below(item_id)
 
       execute_after_delay(0.05, self.save_tree_to_json)
 
@@ -208,6 +229,128 @@ class PipelineCheckerApp(tk.Tk):
     debug("Tree node collapsed.")
     self.save_tree_to_json()
 
+  def on_tree_double_click(self, event):
+    """
+    Callback for double-click on a Treeview row.
+    """
+    # Identify which row was double-clicked
+    item_id = self.tree.focus()
+    
+    if not item_id:
+      return  # No valid item was clicked
+
+    # You can get the row text or values. For example:
+    row_text = self.tree.item(item_id, "text")
+    row_values = self.tree.item(item_id, "values")
+
+    # row_values is typically (id, type, pipeline_status) from your code
+    if len(row_values) < 2:
+      return
+    
+    node_type = row_values[1]
+    
+    if node_type == "project":
+      pipeline = row_values[5]
+      webbrowser.open(row_values[3] + "/-/pipelines" + ("/" + str(pipeline) if pipeline else ""))
+  
+  def on_tree_right_click(self, event):
+    """
+    Handler for right-click in the Treeview: 
+    1) Select the clicked row. 
+    2) Show the context menu.
+    """
+    # Identify the row under the pointer
+    row_id = self.tree.identify_row(event.y)
+    if not row_id:
+      return  # clicked outside rows
+    
+    debug(f"Right-clicked row ID: {row_id}")
+    
+    row_values = self.tree.item(row_id, "values")
+    if len(row_values) < 2:
+      return
+    
+    debug(f"Row values: {row_values}")
+    
+    node_type = row_values[1]
+
+    # Select the row so it's highlighted
+    self.tree.selection_set(row_id)
+    self.tree.focus(row_id)
+
+    # Store the "current" item in some attribute if you want
+    self.current_item_id = row_id
+
+    if node_type == "project":
+      self.project_menu.tk_popup(event.x_root, event.y_root)
+    elif node_type == "group":
+      self.group_menu.tk_popup(event.x_root, event.y_root)
+
+  def get_single_project_pipeline_info(self, token, group_id, project):
+    """
+    Common logic to fetch the pipeline status for a single project.
+    'project' can be a GitLab project dict with at least:
+      {
+        "id": <project_id>,
+        "web_url": "...",
+        "name": "...",
+        ...
+      }
+    Returns (pstatus, pweb, pref, pipeline_id).
+
+    If you have branches configured in BRANCHES for that group_id,
+    it tries get_branches_pipeline_status; otherwise get_latest_pipeline_status.
+    """
+    pid = project["id"]
+    pweb = project.get("web_url", "")
+    pname = project.get("name", "")
+    
+    # Check if we have custom branches
+    branches = BRANCHES.get(str(group_id), None)
+    if branches:
+      pstatus, pref, pipeline_id = self.get_branches_pipeline_status(token, pid, branches)
+    else:
+      # Call get_latest_pipeline_status with optional branch=None
+      pstatus, pref, pipeline_id = self.get_latest_pipeline_status(token, pid, None)
+
+    return (pstatus, pweb, pref, pipeline_id)
+
+
+  def fetch_pipeline_info_for_projects(self, token, group_id, projects):
+    """
+    Common logic to gather pipeline info for multiple projects at once.
+    Returns a *sorted* list of (project, pstatus, pweb, pref, pipeline_id),
+    with failed/canceled first, then success/manual, etc.
+    """
+    projects_with_status = []
+
+    for proj in projects:
+      # Use the single-project helper above
+      pstatus, pweb, pref, pipeline_id = self.get_single_project_pipeline_info(token, group_id, proj)
+
+      if pstatus == "No pipeline found":
+        # Decide if you want to *skip* these or still include them
+        # For now, we'll skip them just like in your original code
+        continue
+
+      projects_with_status.append((proj, pstatus, pweb, pref, pipeline_id))
+
+    # Define priority so failed/canceled appear first
+    def get_priority(status: str):
+      ps_lower = status.lower()
+      if ps_lower in ("failed", "canceled"):
+        return 0
+      elif ps_lower in ("success", "manual"):
+        return 1
+      else:
+        # for "skipped", "running", "pending", etc.
+        return 2
+
+    # Sort by priority
+    projects_with_status.sort(key=lambda x: get_priority(x[1]))
+
+    return projects_with_status
+
   def fetch_subgroups_and_projects(self, tree_item_id, group_id):
     """Fetch child subgroups/projects for a group, removing any dummy children."""
     # Show loading label
@@ -219,9 +362,10 @@ class PipelineCheckerApp(tk.Tk):
       for child in self.tree.get_children(tree_item_id):
         self.tree.delete(child)
 
-      old_vals = self.tree.item(tree_item_id, "values")
+      old_vals = list(self.tree.item(tree_item_id, "values"))
+      old_vals[2] = "fetched"
       # Mark it as 'fetched' now
-      self.tree.item(tree_item_id, values=(old_vals[0], old_vals[1], "fetched"))
+      self.tree.item(tree_item_id, values=tuple(old_vals))
 
       token = self.token_var.get().strip()
       debug("Getting subgroups.")
@@ -231,35 +375,39 @@ class PipelineCheckerApp(tk.Tk):
 
       debug(f"Found {len(subgroups)} subgroups and {len(projects)} projects in group {group_id}.")
 
-      # Subgroups
+      # --------------------------------------------------------------------
+      # Insert subgroups (unmodified):
+      # --------------------------------------------------------------------
       for sg in subgroups:
         sid = sg["id"]
         sname = sg["full_name"]
+        sweb = sg.get("web_url", "")
         node_id = self.tree.insert(
           tree_item_id,
           "end",
           text=f"Group: {sname}",
-          values=(sid, "group", "unfetched"),
+          values=(sid, "group", "unfetched", sweb),
           open=False
         )
         # Insert a dummy child so it can be expanded
         self.tree.insert(node_id, "end", text="Loading...")
 
-      # Projects
-      for proj in projects:
-        pid = proj["id"]
-        pnamef = proj["name_with_namespace"]
-        pname = proj["name"]
-        debug(f"Fetching pipeline for project {pnamef} (ID {pid}).")
-        pstatus = self.get_latest_pipeline_status(token, pid)
-        if pstatus == "No pipeline found":
-          # No pipeline info to show; skip or show text anyway
-          continue
+      # --------------------------------------------------------------------
+      # Build a list of (project, pipeline_status), then sort so failed
+      # pipelines appear at the top.
+      # --------------------------------------------------------------------
+      projects_with_status = self.fetch_pipeline_info_for_projects(token, group_id, projects)
 
-        # Decide which icon & tag to use
+      # --------------------------------------------------------------------
+      # Now insert the projects in sorted order
+      # --------------------------------------------------------------------
+      for proj, pstatus, pweb, pref, pipeline in projects_with_status:
+        pid = proj["id"]
+        pname = proj["name"]
+        ps_lower = pstatus.lower()
+
         icon = None
         tag = ""
-        ps_lower = pstatus.lower()
         if ps_lower in ("success", "manual"):
           icon = self.success_img
           tag = "success_tag"
@@ -273,23 +421,118 @@ class PipelineCheckerApp(tk.Tk):
         text = f"Project: {pname} - Pipeline: {pstatus}"
         debug(f"Inserting project node with text='{text}'.")
 
-        # Insert with image if available, and tag for color
-        # We'll store pipeline status in values for reference
         self.tree.insert(
           tree_item_id,
           "end",
           text=text,
           image=icon,
-          values=(pid, "project", pstatus),
+          values=(pid, "project", pstatus, pweb, pref, pipeline),
           tags=(tag,)
         )
 
     except Exception as e:
       debug(f"Error fetching subgroups/projects: {e}")
       messagebox.showerror("Error", str(e))
+      raise e
     finally:
       # Hide loading label
       self.loading_label.config(text="")
+
+  def refresh_project(self, item_id):
+    """Refresh the clicked project node."""
+    values = self.tree.item(item_id, "values")
+    if len(values) < 6:
+      # Not enough data (id, type, status, web_url, branch, pipeline_id)
+      return
+
+    node_id = values[0]
+    node_type = values[1]
+
+    if node_type == "project":
+      debug(f"Refreshing project node {node_id}.")
+      # Build a minimal project dict so we can call our helper method
+      pname = self.tree.item(item_id, "text")  
+      # "Project: SomeName - Pipeline: X" => we just want "SomeName"
+      pname_clean = pname.split("Project: ", 1)[-1].split(" - Pipeline:")[0].strip()
+      
+      project = {
+        "id": node_id,
+        "web_url": values[3],  # existing
+        "name": pname_clean
+      }
+
+      # If we need the group_id for branches:
+      group_id = self.get_parent_group_id(item_id)
+
+      token = self.token_var.get().strip()
+      pstatus, pweb, pref, pipeline_id = self.get_single_project_pipeline_info(token, group_id, project)
+
+      # Determine new icon/tag
+      ps_lower = pstatus.lower()
+      if ps_lower in ("success", "manual"):
+        icon = self.success_img
+        tag = "success_tag"
+      elif ps_lower in ("failed", "canceled"):
+        icon = self.failed_img
+        tag = "fail_tag"
+      elif ps_lower in ("skipped", "running", "pending"):
+        icon = self.skipped_img
+        tag = "skipped_tag"
+      else:
+        icon = ""
+        tag = ""
+
+      new_text = f"Project: {pname_clean} - Pipeline: {pstatus}"
+
+      # Update the node
+      self.tree.item(
+        item_id,
+        text=new_text,
+        image=icon,
+        tags=(tag,),
+        values=(node_id, "project", pstatus, pweb, pref, pipeline_id)
+      )
+
+  def refresh_all_project_pipelines_below(self, parent_id):
+    """
+    Recursively walk the tree from parent_id.
+    If a node is a 'project', re-fetch its pipeline and update the node.
+    If a node is a 'group', recurse into its children.
+    """
+    children = self.tree.get_children(parent_id)
+
+    old_vals = list(self.tree.item(parent_id, "values"))
+    old_vals[2] = "fetched"
+    # Mark it as 'fetched' now
+    self.tree.item(parent_id, values=tuple(old_vals))
+
+    for child_id in children:
+      values = self.tree.item(child_id, "values")
+      if len(values) < 6:
+        continue
+
+      node_id = values[0]
+      node_type = values[1]
+      if node_type == "project":
+        self.refresh_project(child_id)
+      elif node_type == "group":
+        debug(f"Refreshing a group node {node_id}, not a project.")
+        # Recurse down into this group?s children
+        self.refresh_all_project_pipelines_below(child_id)
+
+  def get_parent_group_id(self, item_id):
+    """
+    Walk upwards until we find a parent node whose 'type' is 'group',
+    then return that group's ID (as string).
+    """
+    parent = self.tree.parent(item_id)
+    while parent:
+      vals = self.tree.item(parent, "values")
+      if len(vals) >= 2 and vals[1] == "group":
+        # The group's ID is vals[0]
+        return str(vals[0])
+      parent = self.tree.parent(parent)
+    return ""
 
   # -------------------------------------------------------------------------
   #  Cache / JSON save & load
@@ -315,7 +558,7 @@ class PipelineCheckerApp(tk.Tk):
     if item_text == "Loading...":
       return None
     
-    item_values = self.tree.item(item_id, "values")  # tuple: (id, type, status)
+    item_values = self.tree.item(item_id, "values")  # tuple: (id, type, status, web_url, branch)
     is_open = self.tree.item(item_id, "open")
     debug(f"Building node dict for {item_text} is_open={bool(is_open)}")
 
@@ -435,19 +678,19 @@ class PipelineCheckerApp(tk.Tk):
     debug("Refreshing open group nodes from GitLab...")
     root_items = self.tree.get_children("")
     for item_id in root_items:
-      self.refresh_group_if_open(item_id)
+      self.refresh_group(item_id)
 
-  def refresh_group_if_open(self, item_id):
+  def refresh_group(self, item_id):
     """Recursively refresh this group if it is open, then check children."""
     is_open = self.tree.item(item_id, "open")
     text = self.tree.item(item_id, "text")
     children = self.tree.get_children(item_id)
-    vals = self.tree.item(item_id, "values")
-    if len(vals) < 3:
+    vals = list(self.tree.item(item_id, "values"))
+    if len(vals) < 4:
       return
 
-    node_id, node_type, status_flag = vals
-    debug(f"Refreshing node {node_type}:{node_id} ({text}) is open. Refreshing.")
+    node_id = vals[0]
+    node_type = vals[1]
 
     if node_type == "group":
       # Re-fetch from GitLab (this will delete old children and insert fresh ones)
@@ -456,12 +699,18 @@ class PipelineCheckerApp(tk.Tk):
       elif bool(is_open):
         # After refreshing, get children and see if any sub-groups are also open
         for child_id in children:
-          self.refresh_group_if_open(child_id)
-    else:
+          self.refresh_group(child_id)
+
+        # 3) Refresh project pipelines under this group
+        self.refresh_all_project_pipelines_below(item_id)
+      else:
+        vals[2] = "unfetched"
+        self.tree.item(item_id, values=tuple(vals))
+    else:      
       # If it's not an open group, just recurse to children
       # (In case you have subgroups under projects, typically not, but just in case)
       for child_id in self.tree.get_children(item_id):
-        self.refresh_group_if_open(child_id)
+        self.refresh_group(child_id)
 
   # -------------------------------------------------------------------------
   #  GitLab helpers
@@ -525,35 +774,178 @@ class PipelineCheckerApp(tk.Tk):
       projects.extend(page_projects)
       page += 1
     return projects
+  
+  def get_branches_pipeline_status(self, token, project_id, branches):
+    for branch in branches:
+      status, ref, pipeline_id = self.get_latest_pipeline_status(token, project_id, branch)
 
-  def get_latest_pipeline_status(self, token, project_id):
+      if pipeline_id != "":
+        debug(f"Branch {branch} status: {status}")
+        return status, ref, pipeline_id
+
+    return "No pipeline found", "", ""
+
+  def get_latest_pipeline_status(self, token, project_id, branch=None):
     """
     Returns the status of the pipeline that truly finished last,
     among the specified branches.
     """
     headers = {"Private-Token": token}
-    params = {
-      # 
-    }
+
+    params = {}
+    if branch:
+      debug(f"Getting latest pipeline for branch {branch}.")
+      params["ref"] = branch
+    
     r = requests.get(
       f"{GITLAB_API_URL}/projects/{project_id}/pipelines/latest",
       headers=headers,
-      #params=params
+      params=params
     )
 
     try:
       r.raise_for_status()
     except requests.exceptions.HTTPError as e:
       if r.status_code in (403, 404):
-        return "No pipeline found"
+        return "No pipeline found", "", ""
       else:
         raise e
 
     pipeline = r.json()
     if not pipeline:
-      return "No pipeline found"
+      return "No pipeline found", "", ""
   
-    return pipeline["status"]
+    #debug(f"Latest pipeline: {pipeline}")
+    return pipeline["status"], pipeline["ref"], pipeline["id"]
+    
+  def retry_pipeline(self, token, project_id, pipeline_id):
+    headers = {"Private-Token": token}
+    url = f"{GITLAB_API_URL}/projects/{project_id}/pipelines/{pipeline_id}/retry"
+    r = requests.post(url, headers=headers)
+    r.raise_for_status()
+    return r.json()
+  
+  def create_pipeline(self, token, project_id, ref="development"):
+    headers = {"Private-Token": token}
+    data = {"ref": ref}
+    url = f"{GITLAB_API_URL}/projects/{project_id}/pipeline"
+    r = requests.post(url, headers=headers, json=data)
+    r.raise_for_status()
+    return r.json()
+  
+  def menu_create_pipeline(self):
+    """Create a new pipeline (e.g. on 'main') for the clicked project."""
+    if not hasattr(self, "current_item_id"):
+      return
+    row_id = self.current_item_id
+
+    row_values = self.tree.item(row_id, "values")
+    if len(row_values) < 4:
+      return
+
+    project_id = row_values[0]
+    node_type = row_values[1]
+    branch = row_values[4]
+
+    if node_type != "project":
+      messagebox.showinfo("Not a Project", "This menu action only applies to projects.")
+      return
+
+    # For demonstration, let's always create a pipeline on 'main'
+    try:
+      created = self.create_pipeline(self.token_var.get(), project_id, branch)
+      new_pid = created.get("id")
+      messagebox.showinfo("Pipeline Created", f"New pipeline (ID={new_pid}) on '{branch}'")
+    except Exception as e:
+      messagebox.showerror("Error", str(e))
+
+  def menu_retry_pipeline(self):
+    """Retry the last pipeline for the clicked project (if possible)."""
+    if not hasattr(self, "current_item_id"):
+      return
+    row_id = self.current_item_id
+
+    row_values = self.tree.item(row_id, "values")
+    # e.g. (project_id, "project", "failed", "https://gitlab.com/...", pipeline_id)
+    debug(f"Row values: {row_values}")
+    if len(row_values) < 5:
+      messagebox.showerror("Error", "Cannot retry pipeline: not enough info stored.")
+      return
+
+    project_id = row_values[0]
+    node_type = row_values[1]
+    pipeline_id = row_values[5]
+
+    if node_type != "project":
+      messagebox.showinfo("Not a Project", "This menu action only applies to projects.")
+      return
+
+    # Here use a helper function to call GitLab's /retry endpoint
+    try:
+      debug(f"Retrying pipeline {pipeline_id} for project {project_id}.")
+      info = self.retry_pipeline(self.token_var.get(), project_id, pipeline_id)
+      #debug(f"Retry info: {info}")
+      messagebox.showinfo("Retry Successful",
+        f"Pipeline {pipeline_id} for project {project_id} was retried.")
+    except Exception as e:
+      messagebox.showerror("Error", str(e))
+  
+  def menu_open_in_browser(self):
+    """Open the clicked row's GitLab URL in a browser."""
+    if not hasattr(self, "current_item_id"):
+      return
+    row_id = self.current_item_id
+
+    row_values = self.tree.item(row_id, "values")
+    if len(row_values) < 3:
+      return
+
+    node_type = row_values[1]
+    web_url = row_values[3]
+    
+    if node_type == "group":
+      if web_url:
+        webbrowser.open(web_url)
+      else:
+        messagebox.showinfo("No URL", "This item does not have a valid web_url.")
+    elif node_type == "project":
+      if web_url:
+        pipeline = row_values[5]
+        debug(f"Opening pipeline {pipeline} for project {row_values[0]} in browser.")
+        if pipeline:
+          webbrowser.open(web_url + "/-/pipelines/" + str(pipeline))
+        else:
+          webbrowser.open(web_url + "/-/pipelines")
+      else:
+        messagebox.showinfo("No URL", "This item does not have a valid web_url.")
+
+  def menu_refresh_group(self):
+    """Refresh the clicked group node."""
+    if not hasattr(self, "current_item_id"):
+      return
+    row_id = self.current_item_id
+
+    row_values = self.tree.item(row_id, "values")
+    if len(row_values) < 2:
+      return
+
+    node_type = row_values[1]
+    if node_type == "group":
+      self.refresh_group(row_id)
+
+  def menu_refresh_project(self):
+    """Refresh the clicked project node."""
+    if not hasattr(self, "current_item_id"):
+      return
+    row_id = self.current_item_id
+
+    row_values = self.tree.item(row_id, "values")
+    if len(row_values) < 2:
+      return
+
+    node_type = row_values[1]
+    if node_type == "project":
+      self.refresh_project(row_id)
 
 # -----------------------------------------------------------------------------
 
