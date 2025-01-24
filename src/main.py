@@ -5,7 +5,6 @@ import os
 import time
 import json
 import asyncio
-import threading
 import webbrowser
 
 # internal imports
@@ -57,7 +56,6 @@ class PipelineCheckerApp(tk.Tk):
 
     self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-    # Debug print
     util.debug("Initializing main app window.")
     self.loaded = False
 
@@ -1037,10 +1035,13 @@ class PipelineCheckerApp(tk.Tk):
 
   def on_closing(self):
     """Handler for the window close event."""
-    util.debug("main app: on_closing called.")
-    util.cancel_delay_timers()
-    self.notification.shutdown()
-    self.destroy()
+    try:
+      util.debug("main app: on_closing called.")
+      util.cancel_delay_timers()
+      self.notification.shutdown()
+      self.destroy()
+    except Exception as e:
+      util.debug(f"Error in on_closing: {e}")
 
 # -----------------------------------------------------------------------------
 

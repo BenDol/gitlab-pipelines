@@ -1,6 +1,6 @@
 RMDIR /S /Q "build"
 RMDIR /S /Q "dist"
-pyinstaller main.py --clean --onefile ^
+pyinstaller src/main.py --clean --onefile ^
 	--name="gitlab-pipelines" ^
 	--version-file="version_info.rc" ^
 	--collect-submodules="gitlab-pipelines" ^
