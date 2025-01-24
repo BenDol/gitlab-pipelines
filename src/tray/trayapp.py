@@ -1,27 +1,21 @@
-import tkinter as tk
+import sys
 import threading
+import asyncio
 import pystray
 from pystray import MenuItem as item
+import tkinter as tk
 from PIL import Image
 
 # internal imports
 import util
 
-settings = util.load_json("settings.json")
-
-DEBUG_ENABLED = settings.get("debug", False)
-def debug(msg):
-  if DEBUG_ENABLED:
-    print(f"[DEBUG] {msg}")
-
-class TrayApp:
+class TrayAppBase:
   def __init__(self, app, icon_path="assets/images/logo"):
     # Create the Tkinter window
     self.root = app
+    self.event_loop = app.event_loop or asyncio.get_event_loop()
     self.icon_path = icon_path
-
-    # Button to minimize to tray
-    #tk.Button(self.root, text="Minimize to Tray", command=self.hide_window).pack(pady=20)
+    self.closed = False
 
     # By default, keep the window visible
     self.is_hidden = False
@@ -35,7 +29,7 @@ class TrayApp:
     self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
   def setup_tray_icon(self):
-    debug("Setting up tray icon")
+    util.debug("Setting up tray icon")
     image = Image.open(self.icon_path + ".png")
 
     # Build a menu for the tray icon
@@ -68,24 +62,43 @@ class TrayApp:
       self.icon.visible = False
 
     self.is_hidden = False
-    self.root.deiconify()  # Show the Tk window
+    self.root.deiconify() # Show the Tk window
 
   def exit_app(self):
     """Exit app from tray."""
+    self.closed = True
     if self.icon:
       self.icon.stop()
+    self.root.on_closing()
     # Safely destroy the Tk mainloop
     self.root.quit()
+    self.event_loop.stop()
 
   def on_closing(self):
     """
     When user clicks the window's close button, 
     optionally minimize to tray or fully exit.
     """
-    # If you want to ALWAYS go to tray instead of closing:
     self.hide_window()
-    # If you want to exit instead:
-    # self.exit_app()
 
   def run(self):
+    """Start the Tkinter mainloop and integrate with asyncio."""
     self.root.mainloop()
+
+
+class TrayAppWin32(TrayAppBase):
+  def __init__(self, app, icon_path="assets/images/logo"):
+    super().__init__(app, icon_path)
+
+
+class TrayAppLinux(TrayAppBase):
+  def __init__(self, app, icon_path="assets/images/logo"):
+    super().__init__(app, icon_path)
+
+
+if sys.platform.startswith('win'):
+  class TrayApp(TrayAppWin32):
+    pass
+elif sys.platform.startswith('linux'):
+  class TrayApp(TrayAppLinux):
+    pass

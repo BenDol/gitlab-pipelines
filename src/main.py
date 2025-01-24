@@ -1,17 +1,19 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
-from plyer import notification
 import requests
 import os
 import time
 import json
+import asyncio
 import threading
 import webbrowser
-import winreg
 
 # internal imports
-import tray
 import util
+settings = util.load_json("settings.json")
+util.DEBUG_ENABLED = settings.get("debug", False)
+from tray.trayapp import TrayApp
+from notification import Notification
 
 # If you need image scaling, install Pillow (pip install pillow).
 try:
@@ -24,46 +26,39 @@ except ImportError:
   ImageTk = None
   RESAMPLE = None
 
-def set_env_var(name, value, system=False):
-  scope = winreg.HKEY_CURRENT_USER if not system else winreg.HKEY_LOCAL_MACHINE
-  sub_key = r'Environment'
-  with winreg.OpenKey(scope, sub_key, 0, winreg.KEY_SET_VALUE) as key:
-    winreg.SetValueEx(key, name, 0, winreg.REG_EXPAND_SZ, value)
-
-settings = util.load_json("settings.json")
-
-DEBUG_ENABLED = settings.get("debug", False)
 APP_NAME = "GitLab Pipelines"
 GITLAB_API_URL = settings.get("gitlab_api_url", "https://gitlab.com/api/v4")
 GROUP_NAME = settings.get("group_name", "insurance-insight")
 CACHE_FILE = "cache.json"
-CACHE_REFRESH_SECONDS = settings.get("cache_refresh_seconds", 60 * 5)
+CACHE_REFRESH_SECONDS = settings.get("cache_refresh_seconds", 10 * 60)
+REFRESH_RATE_SECONDS = settings.get("refresh_rate_seconds", 5 * 60)
 IGNORED_GROUPS = settings.get("ignored_groups", [ "10926345", "6622675" ])
 BRANCHES = {
   "4241428": ["2.0-SNAPSHOT", "1.0-SNAPSHOT"]
 }
-REFRESH_RATE_SECONDS = settings.get("refresh_rate_seconds", 300)
-
-def debug(msg):
-  if DEBUG_ENABLED:
-    print(f"[DEBUG] {msg}")
-
-def execute_after_delay(seconds, my_event, *args, **kwargs):
-  timer = threading.Timer(seconds, my_event, args=args, kwargs=kwargs)
-  timer.start()
-  return timer
 
 class PipelineCheckerApp(tk.Tk):
-  def __init__(self, notif_icon_path="assets/images/notification"):
+  def __init__(self, notif_icon_path="assets/images/notification", event_loop=asyncio.get_event_loop()):
     super().__init__()
+    self.event_loop = event_loop
     self.title(APP_NAME)
     self.iconbitmap("assets/images/logo.ico") 
     self.minsize(width=690, height=200)
+    self.notification = Notification(
+      app_name=APP_NAME,
+      title=APP_NAME, 
+      message="", 
+      icon=notif_icon_path + ".png", 
+      on_dismissed=self.on_notification_dismissed, 
+      event_loop=self.event_loop
+    )
+    self.notifications = []
     self.geometry("690x820")
-    self.notif_icon_path = notif_icon_path
+
+    self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     # Debug print
-    debug("Initializing main app window.")
+    util.debug("Initializing main app window.")
     self.loaded = False
 
     # Load token from environment
@@ -120,7 +115,7 @@ class PipelineCheckerApp(tk.Tk):
     self.skipped_img = None
     if Image and ImageTk:
       try:
-        debug("Loading success.png.")
+        util.debug("Loading success.png.")
         success_raw = Image.open("assets/images/success.png")
         if RESAMPLE:
           success_raw = success_raw.resize((20, 20), RESAMPLE)
@@ -128,10 +123,10 @@ class PipelineCheckerApp(tk.Tk):
           success_raw = success_raw.resize((20, 20), Image.ANTIALIAS)
         self.success_img = ImageTk.PhotoImage(success_raw)
       except Exception as e:
-        debug(f"Cannot load success.png: {e}")
+        util.debug(f"Cannot load success.png: {e}")
 
       try:
-        debug("Loading failed.png.")
+        util.debug("Loading failed.png.")
         failed_raw = Image.open("assets/images/failed.png")
         if RESAMPLE:
           failed_raw = failed_raw.resize((20, 20), RESAMPLE)
@@ -139,10 +134,10 @@ class PipelineCheckerApp(tk.Tk):
           failed_raw = failed_raw.resize((20, 20), Image.ANTIALIAS)
         self.failed_img = ImageTk.PhotoImage(failed_raw)
       except Exception as e:
-        debug(f"Cannot load failed.png: {e}")
+        util.debug(f"Cannot load failed.png: {e}")
 
       try:
-        debug("Loading skipped.png.")
+        util.debug("Loading skipped.png.")
         skipped_raw = Image.open("assets/images/skipped.png")
         if RESAMPLE:
           skipped_raw = skipped_raw.resize((20, 20), RESAMPLE)
@@ -150,15 +145,15 @@ class PipelineCheckerApp(tk.Tk):
           skipped_raw = skipped_raw.resize((20, 20), Image.ANTIALIAS)
         self.skipped_img = ImageTk.PhotoImage(skipped_raw)
       except Exception as e:
-        debug(f"Cannot load skipped.png: {e}")
+        util.debug(f"Cannot load skipped.png: {e}")
 
     # Check for cached JSON at startup
     if os.path.exists(CACHE_FILE):
-      debug("Cached tree file found. Loading from JSON...")
+      util.debug("Cached tree file found. Loading from JSON...")
       mtime = os.path.getmtime(CACHE_FILE)
       age_in_seconds = time.time() - mtime
       if self.load_tree_from_json(CACHE_FILE):
-        debug(f"age_in_seconds: {age_in_seconds}")
+        util.debug(f"age_in_seconds: {age_in_seconds}")
         if age_in_seconds >= CACHE_REFRESH_SECONDS:
           self.loaded = True
           self.refresh_groups(save_json=True)
@@ -181,7 +176,7 @@ class PipelineCheckerApp(tk.Tk):
     self.project_menu.add_command(label="Create Pipeline", command=self.menu_create_pipeline)
 
     # Start the refresh loop
-    self.refresh_loop()
+    util.execute_after_delay(REFRESH_RATE_SECONDS, self.refresh_loop)
 
     self.loaded = True
 
@@ -192,32 +187,33 @@ class PipelineCheckerApp(tk.Tk):
   def refresh_loop(self):
     """Start a refresh loop that runs every REFRESH_RATE_SECONDS."""
     self.refresh_groups()
-    execute_after_delay(REFRESH_RATE_SECONDS, self.refresh_loop)
+    util.execute_after_delay(REFRESH_RATE_SECONDS, self.refresh_loop)
 
   def show_notification(self, title, message, duration=5):
     """
     Display a system notification with the given title and message.
     """
-    app_name = self.title()
-    debug(f"Showing notification: {app_name}|{title}|{message}")
-    try:
-      notification.notify(
-        title=title,
-        message=message,
-        app_name=app_name,
-        app_icon = self.notif_icon_path + ".ico",
-        timeout=duration
-      )
-    except Exception as e:
-      print(f"Failed to show notification: {e}")
+    util.debug(f"Showing notification: {title}|{message}")
+    self.notification.show(title, message, duration, threaded=True)
+
+  def on_notification_dismissed(self, args):
+    """
+    Callback when a notification is dismissed.
+    """
+    sender = args.sender
+    reason = args.reason
+    util.debug(f"Notification dismissed {sender}: {reason}")
+    util.debug(f"Notifications current: {len(self.notifications)}")
+    #self.notifications.remove(sender)
+    util.debug(f"Notifications remaining: {len(self.notifications)}")
 
   def on_token_enterkey(self):
     """Handler for pressing Enter in the token entry field."""
     if self.token_var:
       token = self.token_var.get().strip()
       if token:
-        debug("Token entered. Loading root group.")
-        set_env_var('GITLAB_TOKEN', token)
+        util.debug("Token entered. Loading root group.")
+        util.set_env_var('GITLAB_TOKEN', token)
         self.load_root_group()
         return
 
@@ -225,12 +221,12 @@ class PipelineCheckerApp(tk.Tk):
 
   def load_root_group(self):
     """Fetch the root group from GitLab and populate the tree."""
-    debug("load_root_group called.")
+    util.debug("load_root_group called.")
     self.tree.delete(*self.tree.get_children())
     token = self.token_var.get().strip()
     if not token:
       messagebox.showerror("Error", "Please provide a valid token.")
-      debug("No token provided. Aborting load_root_group.")
+      util.debug("No token provided. Aborting load_root_group.")
       return
 
     # Show "Loading..." label
@@ -238,9 +234,9 @@ class PipelineCheckerApp(tk.Tk):
     self.update_idletasks()
 
     try:
-      debug(f"Getting group ID for {GROUP_NAME}.")
+      util.debug(f"Getting group ID for {GROUP_NAME}.")
       gid = self.get_group_id(token, GROUP_NAME)
-      debug(f"Root group ID is {gid}. Inserting into tree.")
+      util.debug(f"Root group ID is {gid}. Inserting into tree.")
       root_node = self.tree.insert(
         "",
         "end",
@@ -251,7 +247,7 @@ class PipelineCheckerApp(tk.Tk):
       # Dummy child so we can expand
       self.tree.insert(root_node, "end", text="Loading...")
     except Exception as ex:
-      debug(f"Error loading root group: {ex}")
+      util.debug(f"Error loading root group: {ex}")
       messagebox.showerror("Error", str(ex))
     finally:
       # Hide loading label
@@ -260,34 +256,34 @@ class PipelineCheckerApp(tk.Tk):
   def on_tree_open(self, event):
     """Handler triggered when user expands a node in the TreeView."""
     if not self.loaded:
-      debug("on_tree_open: Not loaded yet")
+      util.debug("on_tree_open: Not loaded yet")
       return
 
-    debug("Tree node expanded.")
+    util.debug("Tree node expanded.")
     item_id = self.tree.focus()
     vals = self.tree.item(item_id, "values")
     if len(vals) < 3:
-      debug(f"on_tree_open: Node has insufficient values to process. ({vals})")
+      util.debug(f"on_tree_open: Node has insufficient values to process. ({vals})")
       return
     node_type = vals[1]
     status_flag = vals[2]
     if node_type == "group":
       if status_flag == "unfetched":
-        debug(f"Expanding a group node that hasn't been fetched yet ({item_id}).")
+        util.debug(f"Expanding a group node that hasn't been fetched yet ({item_id}).")
         self.fetch_subgroups_and_projects(item_id, vals[0])
       elif status_flag == "refresh":
-        debug("Refreshing a group node.")
+        util.debug("Refreshing a group node.")
         self.refresh_all_project_pipelines_below(item_id)
 
-      execute_after_delay(0.05, self.save_tree_to_json)
+      util.execute_after_delay(0.05, self.save_tree_to_json)
 
   def on_tree_close(self, event):
     """Handler triggered when user collapses a node in the TreeView."""
     if not self.loaded:
-      debug("on_tree_close: Not loaded yet")
+      util.debug("on_tree_close: Not loaded yet")
       return
     
-    debug("Tree node collapsed.")
+    util.debug("Tree node collapsed.")
     self.save_tree_to_json()
 
   def on_tree_double_click(self, event):
@@ -325,13 +321,13 @@ class PipelineCheckerApp(tk.Tk):
     if not row_id:
       return  # clicked outside rows
     
-    debug(f"Right-clicked row ID: {row_id}")
+    util.debug(f"Right-clicked row ID: {row_id}")
     
     row_values = self.tree.item(row_id, "values")
     if len(row_values) < 2:
       return
     
-    debug(f"Row values: {row_values}")
+    util.debug(f"Row values: {row_values}")
     
     node_type = row_values[1]
 
@@ -421,7 +417,7 @@ class PipelineCheckerApp(tk.Tk):
     self.update_idletasks()
 
     try:
-      debug(f"Fetching subgroups/projects for group_id={group_id}. Removing dummy child.")
+      util.debug(f"Fetching subgroups/projects for group_id={group_id}. Removing dummy child.")
       for child in self.tree.get_children(tree_item_id):
         self.tree.delete(child)
 
@@ -431,12 +427,12 @@ class PipelineCheckerApp(tk.Tk):
       self.tree.item(tree_item_id, values=tuple(old_vals))
 
       token = self.token_var.get().strip()
-      debug("Getting subgroups.")
+      util.debug("Getting subgroups.")
       subgroups = self.get_subgroups(token, group_id)
-      debug("Getting projects.")
+      util.debug("Getting projects.")
       projects = self.get_group_projects(token, group_id)
 
-      debug(f"Found {len(subgroups)} subgroups and {len(projects)} projects in group {group_id}.")
+      util.debug(f"Found {len(subgroups)} subgroups and {len(projects)} projects in group {group_id}.")
 
       # --------------------------------------------------------------------
       # Insert subgroups (unmodified):
@@ -444,7 +440,7 @@ class PipelineCheckerApp(tk.Tk):
       for sg in subgroups:
         sid = sg["id"]
         if str(sid) in IGNORED_GROUPS:
-          debug(f"Ignoring group {sid}.")
+          util.debug(f"Ignoring group {sid}.")
           continue
         sname = sg["full_name"]
         sweb = sg.get("web_url", "")
@@ -485,7 +481,7 @@ class PipelineCheckerApp(tk.Tk):
           tag = "skipped_tag"
 
         text = f" Project: {pname} - Pipeline: {pstatus}"
-        debug(f"Inserting project node with text='{text}'.")
+        util.debug(f"Inserting project node with text='{text}'.")
 
         self.tree.insert(
           tree_item_id,
@@ -497,7 +493,7 @@ class PipelineCheckerApp(tk.Tk):
         )
 
     except Exception as e:
-      debug(f"Error fetching subgroups/projects: {e}")
+      util.debug(f"Error fetching subgroups/projects: {e}")
       messagebox.showerror("Error", str(e))
       raise e
     finally:
@@ -509,14 +505,14 @@ class PipelineCheckerApp(tk.Tk):
     values = self.tree.item(item_id, "values")
     if len(values) < 4:
       # Not enough data (id, type, status, web_url, branch, pipeline_id)
-      debug(f"refresh_project: Node {item_id} has insufficient values to process. ({values})")
+      util.debug(f"refresh_project: Node {item_id} has insufficient values to process. ({values})")
       return
 
     node_id = values[0]
     node_type = values[1]
 
     if node_type == "project":
-      debug(f"Refreshing project node {node_id}.")
+      util.debug(f"Refreshing project node {node_id}.")
       # Build a minimal project dict so we can call our helper method
       pname = self.tree.item(item_id, "text")  
       # "Project: SomeName - Pipeline: X" => we just want "SomeName"
@@ -561,7 +557,7 @@ class PipelineCheckerApp(tk.Tk):
       )
       
     if save_json:
-      execute_after_delay(0.05, self.save_tree_to_json)
+      util.execute_after_delay(0.05, self.save_tree_to_json)
 
   def refresh_all_project_pipelines_below(self, parent_id):
     """
@@ -576,19 +572,19 @@ class PipelineCheckerApp(tk.Tk):
     # Mark it as 'fetched' now
     self.tree.item(parent_id, values=tuple(old_vals))
 
-    debug(f"refresh_all_project_pipelines_below: {parent_id} ({len(children)}) ({old_vals})")
+    util.debug(f"refresh_all_project_pipelines_below: {parent_id} ({len(children)}) ({old_vals})")
 
     for child_id in children:
       values = self.tree.item(child_id, "values")
       if len(values) < 4:
-        debug(f"Node {child_id} has insufficient values to process. ({values})")
+        util.debug(f"Node {child_id} has insufficient values to process. ({values})")
         continue
 
       node_type = values[1]
       if node_type == "project":
         self.refresh_project(child_id)
       elif node_type == "group":
-        debug(f"Refreshing a group node {child_id}")
+        util.debug(f"Refreshing a group node {child_id}")
         self.refresh_all_project_pipelines_below(child_id)
 
   def get_parent_group_id(self, item_id):
@@ -615,7 +611,7 @@ class PipelineCheckerApp(tk.Tk):
     if not self.loaded:
       return
 
-    debug(f"Saving tree structure to {filename}...")
+    util.debug(f"Saving tree structure to {filename}...")
     # Build a recursive structure from the root items
     root_items = self.tree.get_children("")
     data_list = [self.build_node_dict(item_id) for item_id in root_items]
@@ -631,7 +627,7 @@ class PipelineCheckerApp(tk.Tk):
     
     item_values = self.tree.item(item_id, "values")  # tuple: (id, type, status, web_url, branch)
     is_open = self.tree.item(item_id, "open")
-    debug(f"Building node dict for {item_text} is_open={bool(is_open)}")
+    util.debug(f"Building node dict for {item_text} is_open={bool(is_open)}")
 
     node_data = {
       "text": item_text,
@@ -651,7 +647,7 @@ class PipelineCheckerApp(tk.Tk):
 
   def load_tree_from_json(self, filename=CACHE_FILE):
     """Load the entire tree from a JSON file and rebuild the TreeView."""
-    debug(f"Loading tree structure from {filename}...")
+    util.debug(f"Loading tree structure from {filename}...")
 
     # Clear any existing tree items
     self.tree.delete(*self.tree.get_children())
@@ -660,7 +656,7 @@ class PipelineCheckerApp(tk.Tk):
       with open(filename, "r", encoding="utf-8") as f:
         data_list = json.load(f)
     except Exception as e:
-      debug(f"Could not load {filename}: {e}")
+      util.debug(f"Could not load {filename}: {e}")
       messagebox.showerror("Error", f"Could not load {filename}: {e}")
       return False
 
@@ -690,7 +686,7 @@ class PipelineCheckerApp(tk.Tk):
     if len(vals) < 2:
       # This means we can't safely do vals[1]
       # You can skip, or you can default them:
-      debug(f"Warning: Node '{text}' has invalid 'values': {vals}. Skipping or using defaults.")
+      util.debug(f"Warning: Node '{text}' has invalid 'values': {vals}. Skipping or using defaults.")
       # For example, skip entirely:
       return
 
@@ -728,7 +724,7 @@ class PipelineCheckerApp(tk.Tk):
     item_id = self.tree.insert(parent_id, "end", **insert_kwargs)
 
     # Now set open state
-    debug(f"Node {text} is_open={bool(is_open)}")
+    util.debug(f"Node {text} is_open={bool(is_open)}")
     self.tree.item(item_id, open=bool(is_open))
 
     if node_type == "group":
@@ -746,17 +742,17 @@ class PipelineCheckerApp(tk.Tk):
     are 'open' and re-fetches them from GitLab, so the 'currently
     showing' projects are refreshed.
     """
-    debug("Refreshing open group nodes from GitLab...")
+    util.debug("Refreshing open group nodes from GitLab...")
     self.loading_label.config(text="Refreshing groups...")
     self.update_idletasks()
     root_items = self.tree.get_children("")
     for item_id in root_items:
-      debug(f"refresh_groups: Refreshing {item_id}")
+      util.debug(f"refresh_groups: Refreshing {item_id}")
       self.refresh_group(item_id)
 
     self.loading_label.config(text="")
     if save_json:
-      execute_after_delay(0.05, self.save_tree_to_json)
+      util.execute_after_delay(0.05, self.save_tree_to_json)
 
   def refresh_group(self, item_id, save_json=False):
     """Recursively refresh this group if it is open, then check children."""
@@ -786,31 +782,31 @@ class PipelineCheckerApp(tk.Tk):
         self.refresh_group(child_id)
 
     if save_json:
-      execute_after_delay(0.05, self.save_tree_to_json)
+      util.execute_after_delay(0.05, self.save_tree_to_json)
 
   # -------------------------------------------------------------------------
   #  GitLab helpers
   # -------------------------------------------------------------------------
 
   def get_group_id(self, token, group_name):
-    debug("get_group_id called.")
+    util.debug("get_group_id called.")
     if group_name.isdigit():
-      debug("Group name is numeric, using directly.")
+      util.debug("Group name is numeric, using directly.")
       return group_name
     headers = {"Private-Token": token}
     r = requests.get(f"{GITLAB_API_URL}/groups", headers=headers, params={"search": group_name})
     r.raise_for_status()
     groups = r.json()
-    debug(f"{len(groups)} groups returned from search.")
+    util.debug(f"{len(groups)} groups returned from search.")
     for g in groups:
       # Compare either 'name' or 'path' to group_name, ignoring case
       if g["name"].lower() == group_name.lower() or g["path"].lower() == group_name.lower():
-        debug(f"Matched group ID {g['id']}.")
+        util.debug(f"Matched group ID {g['id']}.")
         return g["id"]
     raise ValueError(f"Group not found: {group_name}")
 
   def get_subgroups(self, token, group_id):
-    debug(f"get_subgroups called for group_id={group_id}.")
+    util.debug(f"get_subgroups called for group_id={group_id}.")
     headers = {"Private-Token": token}
     subgroups = []
     page = 1
@@ -823,15 +819,15 @@ class PipelineCheckerApp(tk.Tk):
       r.raise_for_status()
       data = r.json()
       if not data:
-        debug("No more subgroups found.")
+        util.debug("No more subgroups found.")
         break
-      debug(f"Found {len(data)} subgroups on page {page}.")
+      util.debug(f"Found {len(data)} subgroups on page {page}.")
       subgroups.extend(data)
       page += 1
     return subgroups
 
   def get_group_projects(self, token, group_id):
-    debug(f"get_group_projects called for group_id={group_id}.")
+    util.debug(f"get_group_projects called for group_id={group_id}.")
     headers = {"Private-Token": token}
     projects = []
     page = 1
@@ -844,9 +840,9 @@ class PipelineCheckerApp(tk.Tk):
       r.raise_for_status()
       page_projects = r.json()
       if not page_projects:
-        debug("No more projects on this page.")
+        util.debug("No more projects on this page.")
         break
-      debug(f"Found {len(page_projects)} projects on page {page}.")
+      util.debug(f"Found {len(page_projects)} projects on page {page}.")
       projects.extend(page_projects)
       page += 1
     return projects
@@ -856,7 +852,7 @@ class PipelineCheckerApp(tk.Tk):
       status, ref, pipeline_id = self.get_latest_pipeline_status(token, project_id, branch)
 
       if pipeline_id != "":
-        debug(f"Branch {branch} status: {status}")
+        util.debug(f"Branch {branch} status: {status}")
         return status, ref, pipeline_id
 
     return "No pipeline found", "", ""
@@ -870,7 +866,7 @@ class PipelineCheckerApp(tk.Tk):
 
     params = {}
     if branch:
-      debug(f"Getting latest pipeline for branch {branch}.")
+      util.debug(f"Getting latest pipeline for branch {branch}.")
       params["ref"] = branch
     
     r = requests.get(
@@ -891,7 +887,7 @@ class PipelineCheckerApp(tk.Tk):
     if not pipeline:
       return "No pipeline found", "", ""
   
-    #debug(f"Latest pipeline: {pipeline}")
+    #util.debug(f"Latest pipeline: {pipeline}")
     return pipeline["status"], pipeline["ref"], pipeline["id"]
     
   def retry_pipeline(self, token, project_id, pipeline_id):
@@ -944,7 +940,7 @@ class PipelineCheckerApp(tk.Tk):
 
     row_values = self.tree.item(row_id, "values")
     # e.g. (project_id, "project", "failed", "https://gitlab.com/...", pipeline_id)
-    debug(f"Row values: {row_values}")
+    util.debug(f"Row values: {row_values}")
     if len(row_values) < 5:
       messagebox.showerror("Error", "Cannot retry pipeline: not enough info stored.")
       return
@@ -960,13 +956,13 @@ class PipelineCheckerApp(tk.Tk):
 
     # Here use a helper function to call GitLab's /retry endpoint
     try:
-      debug(f"Retrying pipeline {pipeline_id} for project {project_name} ({project_id}).")
+      util.debug(f"Retrying pipeline {pipeline_id} for project {project_name} ({project_id}).")
       info = self.retry_pipeline(self.token_var.get(), project_id, pipeline_id)
-      #debug(f"Retry info: {info}")
+      #util.debug(f"Retry info: {info}")
       #messagebox.showinfo("Retry Successful", f"Pipeline {pipeline_id} for project '{project_name}' was retried.")
       self.show_notification(f"Retrying Pipeline", f"Pipeline {pipeline_id} retried for '{project_name}'.")
       
-      execute_after_delay(3, self.refresh_project, row_id, save_json=True)
+      util.execute_after_delay(3, self.refresh_project, row_id, save_json=True)
     except Exception as e:
       messagebox.showerror("Error", str(e))
   
@@ -991,7 +987,7 @@ class PipelineCheckerApp(tk.Tk):
     elif node_type == "project":
       if web_url:
         pipeline = row_values[5]
-        debug(f"Opening pipeline {pipeline} for project {row_values[0]} in browser.")
+        util.debug(f"Opening pipeline {pipeline} for project {row_values[0]} in browser.")
         if pipeline:
           webbrowser.open(web_url + "/-/pipelines/" + str(pipeline))
         else:
@@ -1039,11 +1035,22 @@ class PipelineCheckerApp(tk.Tk):
 
     self.loading_label.config(text="")
 
+  def on_closing(self):
+    """Handler for the window close event."""
+    util.debug("main app: on_closing called.")
+    util.cancel_delay_timers()
+    self.notification.shutdown()
+    self.destroy()
+
 # -----------------------------------------------------------------------------
 
 def main():
-  app = tray.TrayApp(PipelineCheckerApp())
+  loop = asyncio.get_event_loop()
+  app = TrayApp(PipelineCheckerApp(event_loop=loop))
   app.run()
 
 if __name__ == "__main__":
-  main()
+  try:
+    main()
+  except KeyboardInterrupt:
+      print("Application interrupted by user.")
