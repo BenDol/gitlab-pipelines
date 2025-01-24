@@ -170,3 +170,8 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 /cached_tree.json
+
+# Custom
+version_info.bin
+/gitlab-pipelines.zip
+/cache.json

@@ -1,13 +1,17 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
+from plyer import notification
 import requests
 import os
 import time
 import json
 import threading
 import webbrowser
-import trayapp
 import winreg
+
+# internal imports
+import tray
+import util
 
 # If you need image scaling, install Pillow (pip install pillow).
 try:
@@ -26,29 +30,19 @@ def set_env_var(name, value, system=False):
   with winreg.OpenKey(scope, sub_key, 0, winreg.KEY_SET_VALUE) as key:
     winreg.SetValueEx(key, name, 0, winreg.REG_EXPAND_SZ, value)
 
-def load_json(file):
-  if not file.endswith(".json"):
-    file += ".json"
-  f = open(os.getcwd() + '/' + file, )
-  conf = json.load(f)
-  f.close()
-  return conf
-
-settings = load_json("settings.json")
+settings = util.load_json("settings.json")
 
 DEBUG_ENABLED = settings.get("debug", False)
 def debug(msg):
   if DEBUG_ENABLED:
     print(f"[DEBUG] {msg}")
 
+APP_NAME = "GitLab Pipelines"
 GITLAB_API_URL = settings.get("gitlab_api_url", "https://gitlab.com/api/v4")
 GROUP_NAME = settings.get("group_name", "insurance-insight")
 CACHE_FILE = "cache.json"
 CACHE_REFRESH_SECONDS = settings.get("cache_refresh_seconds", 60 * 5)
-IGNORED_GROUPS = settings.get("ignored_groups", [
-  "10926345",
-  "6622675"
-])
+IGNORED_GROUPS = settings.get("ignored_groups", [ "10926345", "6622675" ])
 BRANCHES = {
   "4241428": ["2.0-SNAPSHOT", "1.0-SNAPSHOT"]
 }
@@ -59,12 +53,13 @@ def execute_after_delay(seconds, my_event, *args, **kwargs):
   return timer
 
 class PipelineCheckerApp(tk.Tk):
-  def __init__(self):
+  def __init__(self, notif_icon_path="assets/images/notification"):
     super().__init__()
-    self.title("GitLab Pipelines")
+    self.title(APP_NAME)
     self.iconbitmap("assets/images/logo.ico") 
     self.minsize(width=690, height=200)
     self.geometry("690x820")
+    self.notif_icon_path = notif_icon_path
 
     # Debug print
     debug("Initializing main app window.")
@@ -164,7 +159,8 @@ class PipelineCheckerApp(tk.Tk):
       if self.load_tree_from_json(CACHE_FILE):
         debug(f"age_in_seconds: {age_in_seconds}")
         if age_in_seconds >= CACHE_REFRESH_SECONDS:
-          self.refresh_groups(save_json=False)
+          self.loaded = True
+          self.refresh_groups(save_json=True)
       else:
         self.load_root_group()
     else:
@@ -188,6 +184,23 @@ class PipelineCheckerApp(tk.Tk):
   # -------------------------------------------------------------------------
   #  Core functionalities
   # -------------------------------------------------------------------------
+
+  def show_notification(self, title, message, duration=5):
+    """
+    Display a system notification with the given title and message.
+    """
+    app_name = self.title()
+    debug(f"Showing notification: {app_name}|{title}|{message}")
+    try:
+      notification.notify(
+        title=title,
+        message=message,
+        app_name=app_name,
+        app_icon = self.notif_icon_path + ".ico",
+        timeout=duration
+      )
+    except Exception as e:
+      print(f"Failed to show notification: {e}")
 
   def on_token_enterkey(self):
     """Handler for pressing Enter in the token entry field."""
@@ -462,7 +475,7 @@ class PipelineCheckerApp(tk.Tk):
           icon = self.skipped_img
           tag = "skipped_tag"
 
-        text = f"Project: {pname} - Pipeline: {pstatus}"
+        text = f" Project: {pname} - Pipeline: {pstatus}"
         debug(f"Inserting project node with text='{text}'.")
 
         self.tree.insert(
@@ -498,7 +511,7 @@ class PipelineCheckerApp(tk.Tk):
       # Build a minimal project dict so we can call our helper method
       pname = self.tree.item(item_id, "text")  
       # "Project: SomeName - Pipeline: X" => we just want "SomeName"
-      pname_clean = pname.split("Project: ", 1)[-1].split(" - Pipeline:")[0].strip()
+      pname_clean = pname.split(" Project: ", 1)[-1].split(" - Pipeline:")[0].strip()
       
       project = {
         "id": node_id,
@@ -527,7 +540,7 @@ class PipelineCheckerApp(tk.Tk):
         icon = ""
         tag = ""
 
-      new_text = f"Project: {pname_clean} - Pipeline: {pstatus}"
+      new_text = f" Project: {pname_clean} - Pipeline: {pstatus}"
 
       # Update the node
       self.tree.item(
@@ -909,7 +922,8 @@ class PipelineCheckerApp(tk.Tk):
     try:
       created = self.create_pipeline(self.token_var.get(), project_id, branch)
       new_pid = created.get("id")
-      messagebox.showinfo("Pipeline Created", f"New pipeline (ID={new_pid}) on '{branch}'")
+      #messagebox.showinfo("Pipeline Created", f"New pipeline (ID={new_pid}) on '{branch}'")
+      self.show_notification("Pipeline Created", f"New pipeline (ID={new_pid}) on '{branch}'")
     except Exception as e:
       messagebox.showerror("Error", str(e))
 
@@ -940,8 +954,8 @@ class PipelineCheckerApp(tk.Tk):
       debug(f"Retrying pipeline {pipeline_id} for project {project_name} ({project_id}).")
       info = self.retry_pipeline(self.token_var.get(), project_id, pipeline_id)
       #debug(f"Retry info: {info}")
-      messagebox.showinfo("Retry Successful",
-        f"Pipeline {pipeline_id} for project '{project_name}' was retried.")
+      #messagebox.showinfo("Retry Successful", f"Pipeline {pipeline_id} for project '{project_name}' was retried.")
+      self.show_notification(f"Retrying Pipeline", f"Pipeline {pipeline_id} retried for '{project_name}'.")
       
       execute_after_delay(3, self.refresh_project, row_id, save_json=True)
     except Exception as e:
@@ -1018,6 +1032,9 @@ class PipelineCheckerApp(tk.Tk):
 
 # -----------------------------------------------------------------------------
 
-if __name__ == "__main__":
-  app = trayapp.TrayApp(PipelineCheckerApp())
+def main():
+  app = tray.TrayApp(PipelineCheckerApp())
   app.run()
+
+if __name__ == "__main__":
+  main()
