@@ -33,10 +33,6 @@ def set_env_var(name, value, system=False):
 settings = util.load_json("settings.json")
 
 DEBUG_ENABLED = settings.get("debug", False)
-def debug(msg):
-  if DEBUG_ENABLED:
-    print(f"[DEBUG] {msg}")
-
 APP_NAME = "GitLab Pipelines"
 GITLAB_API_URL = settings.get("gitlab_api_url", "https://gitlab.com/api/v4")
 GROUP_NAME = settings.get("group_name", "insurance-insight")
@@ -46,6 +42,11 @@ IGNORED_GROUPS = settings.get("ignored_groups", [ "10926345", "6622675" ])
 BRANCHES = {
   "4241428": ["2.0-SNAPSHOT", "1.0-SNAPSHOT"]
 }
+REFRESH_RATE_SECONDS = settings.get("refresh_rate_seconds", 300)
+
+def debug(msg):
+  if DEBUG_ENABLED:
+    print(f"[DEBUG] {msg}")
 
 def execute_after_delay(seconds, my_event, *args, **kwargs):
   timer = threading.Timer(seconds, my_event, args=args, kwargs=kwargs)
@@ -179,11 +180,19 @@ class PipelineCheckerApp(tk.Tk):
     self.project_menu.add_command(label="Retry Pipeline", command=self.menu_retry_pipeline)
     self.project_menu.add_command(label="Create Pipeline", command=self.menu_create_pipeline)
 
+    # Start the refresh loop
+    self.refresh_loop()
+
     self.loaded = True
 
   # -------------------------------------------------------------------------
   #  Core functionalities
   # -------------------------------------------------------------------------
+
+  def refresh_loop(self):
+    """Start a refresh loop that runs every REFRESH_RATE_SECONDS."""
+    self.refresh_groups()
+    execute_after_delay(REFRESH_RATE_SECONDS, self.refresh_loop)
 
   def show_notification(self, title, message, duration=5):
     """
