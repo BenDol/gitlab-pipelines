@@ -83,10 +83,13 @@ class AsyncNotifier:
     """
     Gracefully shut down the background loop/thread if needed.
     """
-    def stop_loop():
-      self.loop.stop()
-    asyncio.run_coroutine_threadsafe(stop_loop(), self.loop)
-    self.thread.join()
+    try:
+      def stop_loop():
+        self.loop.stop()
+      asyncio.run_coroutine_threadsafe(stop_loop(), self.loop)
+      self.thread.join()
+    except Exception as e:
+      print("[BackgroundNotifier] ERROR in shutdown:", e)
 
 
 class NotificationWin32:
