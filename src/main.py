@@ -1,5 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
+import ctypes
+import sys
 import requests
 import os
 import time
@@ -7,12 +9,17 @@ import json
 import asyncio
 import webbrowser
 
+if sys.platform == "win32":
+  dwmapi = ctypes.WinDLL("dwmapi")
+  DWMWA_USE_IMMERSIVE_DARK_MODE = 20  # For Win10 1809+; sometimes 19 is used on earlier builds
+
 # internal imports
 import util
 settings = util.load_json("settings.json")
 util.DEBUG_ENABLED = settings.get("debug", False)
 from tray.trayapp import TrayApp
 from notification import Notification
+from event import EventBus
 
 # If you need image scaling, install Pillow (pip install pillow).
 try:
@@ -33,12 +40,16 @@ CACHE_REFRESH_SECONDS = settings.get("cache_refresh_seconds", 10 * 60)
 REFRESH_RATE_SECONDS = settings.get("refresh_rate_seconds", 5 * 60)
 IGNORED_GROUPS = settings.get("ignored_groups", [ "10926345", "6622675" ])
 BRANCHES = {
-  "4241428": ["2.0-SNAPSHOT", "1.0-SNAPSHOT"]
+  "4241428": ["2.0-SNAPSHOT", "2.0.0-SNAPSHOT", "1.0-SNAPSHOT", "1.0.0-SNAPSHOT"]
 }
+DARK_MODE = settings.get("dark_mode", True)
 
 class PipelineCheckerApp(tk.Tk):
   def __init__(self, notif_icon_path="assets/images/notification", event_loop=asyncio.get_event_loop()):
     super().__init__()
+    self.geometry("690x820")
+    self._offsetx = 0
+    self._offsety = 0
     self.event_loop = event_loop
     self.title(APP_NAME)
     self.iconbitmap("assets/images/logo.ico") 
@@ -52,8 +63,8 @@ class PipelineCheckerApp(tk.Tk):
       event_loop=self.event_loop
     )
     self.notifications = []
-    self.geometry("690x820")
 
+    self.after(10, self.try_dark_title_bar)
     self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     util.debug("Initializing main app window.")
@@ -63,17 +74,62 @@ class PipelineCheckerApp(tk.Tk):
     self.token_var = tk.StringVar()
     self.token_var.set(os.getenv("GITLAB_TOKEN", ""))
 
+    def pipeline_status_changed(project_id, project_name, old_status, new_status):
+      if old_status != "fetched":
+        self.show_notification(
+          f"Pipeline status changed for {project_name}",
+          f"Status: {old_status} -> {new_status}"
+        )
+    
+    self.event_bus = EventBus()
+    self.event_bus.subscribe("pipeline_status_changed", pipeline_status_changed)
+
     # Increase font and row size in Treeview
     style = ttk.Style(self)
+    style.theme_use("clam")
     style.configure("Treeview", font=("Arial", 14), rowheight=30)
 
-    # Top input frame
-    input_frame = ttk.Frame(self)
+    if DARK_MODE:
+      style.configure(
+        "Treeview",
+        background="#2E2E2E",       # Tree body background
+        foreground="white",        # Text color
+        fieldbackground="#2E2E2E", # Background color for cells
+        bordercolor="#2E2E2E",
+        borderwidth=1
+      )
+
+      style.configure(
+        "Treeview.Heading",
+        background="#3A3A3A",       # Header background
+        foreground="white",        # Header text color
+        relief="flat"             # Remove 3D effect if desired
+      )             
+
+      # Change the color of selected rows
+      style.map(
+        "Treeview",
+        background=[("selected", "#525252")],
+        foreground=[("selected", "white")]
+      )
+
+      style.layout("Treeview",
+        [
+          ("Treeview.treearea", {"sticky": "nswe"})
+        ]
+      )
+
+    # --- Layout ---
+    #self.build_top_panel()
+
+    input_frame = ttk.Frame(self, relief="flat")
+    input_frame.configure(borderwidth=0)
     input_frame.pack(padx=10, pady=10, fill="x")
 
-    ttk.Label(input_frame, text="Personal Access Token:").pack(side="left")
+    ttk.Label(input_frame, text="Personal Access Token:", font=("Arial", 12)).pack(side="left")
     self.token_entry = ttk.Entry(input_frame, textvariable=self.token_var, width=50, show="*")
     self.token_entry.bind("<Return>", lambda e: self.on_token_enterkey())
+    self.token_entry.bind("<FocusOut>", lambda e: self.on_token_enterkey())
     self.token_entry.pack(side="left", padx=5)
 
     load_button = ttk.Button(input_frame, text="Reset Groups", command=self.load_root_group)
@@ -86,10 +142,18 @@ class PipelineCheckerApp(tk.Tk):
     tree_frame = ttk.Frame(self)
     tree_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-    self.tree = ttk.Treeview(tree_frame)
+    if DARK_MODE:
+      tree_frame.configure(borderwidth=0, relief="flat")
+
+    self.tree = ttk.Treeview(tree_frame, show="tree")
     self.tree.pack(side="left", fill="both", expand=True)
 
-    scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+    scrollbar = ttk.Scrollbar(
+      tree_frame, 
+      orient="vertical", 
+      command=self.tree.yview,
+      style="Vertical.TScrollbar"
+    )
     scrollbar.pack(side="right", fill="y")
     self.tree.config(yscrollcommand=scrollbar.set)
 
@@ -101,6 +165,13 @@ class PipelineCheckerApp(tk.Tk):
     # A label at the bottom to indicate "Loading..."
     self.loading_label = ttk.Label(self, text="", foreground="blue")
     self.loading_label.pack(side="left", pady=5, padx=7)
+
+    self.last_refresh_label = ttk.Label(self, text="", foreground="black")
+    self.last_refresh_label.pack(side="right", pady=5, padx=7)
+
+    if DARK_MODE:
+      self.loading_label.configure(background="#2e2e2e", foreground="#62afff")
+      self.last_refresh_label.configure(background="#2e2e2e", foreground="#62afff")
 
     # Tags to color rows
     self.tree.tag_configure("success_tag", foreground="green")
@@ -145,6 +216,77 @@ class PipelineCheckerApp(tk.Tk):
       except Exception as e:
         util.debug(f"Cannot load skipped.png: {e}")
 
+    if DARK_MODE:
+      # Main window background
+      self.configure(bg="#2e2e2e")
+
+      # Frame background
+      style.configure(
+        "TFrame",
+        background="#2e2e2e",
+        borderwidth=1,
+        relief="flat"
+      )
+
+      # Label styling
+      style.configure(
+        "TLabel", 
+        background="#2e2e2e", 
+        foreground="#ffffff"
+      )
+
+      # Button styling
+      style.configure(
+        "TButton",
+        background="#3e3e3e",
+        foreground="#ffffff",
+        bordercolor="#555555",
+        relief="flat",
+        borderwidth=1
+      )
+      style.map(
+        "TButton",
+        background=[("active", "#555555")],
+        foreground=[("active", "#ffffff")]
+      )
+
+      # Entry styling
+      style.configure(
+        "TEntry",
+        fieldbackground="#3e3e3e",
+        foreground="#ffffff",
+        insertcolor="#ffffff",
+        bordercolor="#2e2e2e",
+        relief="flat"
+      )
+
+      # Scrollbar styling
+      style.configure(
+        "Vertical.TScrollbar",
+        background="#3e3e3e",
+        troughcolor="#2e2e2e",
+        bordercolor="#2e2e2e",
+        arrowcolor="#ffffff",
+        borderwidth=0,
+        relief="flat"
+      )
+      style.map(
+        "Vertical.TScrollbar",
+        background=[("active", "#555555"), ("!disabled", "#3e3e3e")],
+        arrowcolor=[("active", "#ffffff"), ("!disabled", "#ffffff")]
+      )
+      style.layout("Vertical.TScrollbar", [
+        ("Vertical.Scrollbar.trough", {"sticky": "nswe"}),
+        ("Vertical.Scrollbar.thumb",  {"sticky": "nswe"}),
+      ])
+
+      self.loading_label.configure(background="#2e2e2e", foreground="#62afff")
+      self.last_refresh_label.configure(background="#2e2e2e", foreground="#62afff")
+
+      self.tree.tag_configure("success_tag", foreground="#9cff9c")  # pastel green
+      self.tree.tag_configure("fail_tag", foreground="#ff8080")     # pastel red
+      self.tree.tag_configure("skipped_tag", foreground="#cccccc")  # lighter gray
+
     # Check for cached JSON at startup
     if os.path.exists(CACHE_FILE):
       util.debug("Cached tree file found. Loading from JSON...")
@@ -177,11 +319,110 @@ class PipelineCheckerApp(tk.Tk):
     util.execute_after_delay(REFRESH_RATE_SECONDS, self.refresh_loop)
 
     self.loaded = True
+    
+  # -------------------------------------------------------------------------
+  #  UI functionalities
+  # -------------------------------------------------------------------------
+
+  def set_dark_title_bar(self, hwnd):
+    """
+    Attempt to enable Windows 10/11 dark title bar on a given hwnd.
+    Only works on newer Windows builds that support the 'immersive dark mode' attribute.
+    """
+    if sys.platform == "win32":
+      rendering_policy = ctypes.c_int(1)  # 1 = enabled, 0 = disabled
+      dwmapi.DwmSetWindowAttribute(
+        ctypes.c_void_p(hwnd),
+        ctypes.c_uint(DWMWA_USE_IMMERSIVE_DARK_MODE),
+        ctypes.byref(rendering_policy),
+        ctypes.sizeof(rendering_policy)
+      )
+
+  def try_dark_title_bar(self):
+    """
+    Get the underlying Win32 HWND for this Tk window, then call set_dark_title_bar.
+    """
+    # On Windows, .winfo_id() returns the HWND for the root window in Python 3.x
+    if sys.platform == "win32":
+      hwnd = self.winfo_id()
+      self.set_dark_title_bar(hwnd)
+
+  def build_top_panel(self):
+    self.overrideredirect(True)
+
+    self.title_bar = tk.Frame(self, bg="#2e2e2e" if DARK_MODE else None, height=32)
+    self.title_bar.pack(fill="x")
+
+    # A label to show your window's title (or icons, etc.)
+    self.title_label = tk.Label(
+      self.title_bar,
+      text=APP_NAME,
+      bg="#2e2e2e" if DARK_MODE else None,
+      fg="#ffffff" if DARK_MODE else "#000000",
+    )
+    self.title_label.pack(side="left", padx=10)
+
+    # A close button on the right side
+    self.close_button = tk.Button(
+      self.title_bar,
+      text=" X ",
+      bg="#2e2e2e" if DARK_MODE else "#ff0000",
+      fg="#ffffff" if DARK_MODE else "#000000",
+      bd=0,
+      command=self.on_close
+    )
+    self.close_button.pack(side="right", padx=5)
+
+    # (Optional) Minimize button example
+    self.min_button = tk.Button(
+      self.title_bar,
+      text="_",
+      bg="#2e2e2e" if DARK_MODE else "#00ff00",
+      fg="#ffffff" if DARK_MODE else "#000000",
+      bd=0,
+      command=self.on_minimize
+    )
+    self.min_button.pack(side="right", padx=5)
+
+    # Bind mouse events so we can drag the window around
+    self.title_bar.bind("<Button-1>", self.start_move)
+    self.title_bar.bind("<B1-Motion>", self.on_move)
 
   # -------------------------------------------------------------------------
   #  Core functionalities
   # -------------------------------------------------------------------------
+  
+  def start_move(self, event):
+    """
+    Remember the mouse offset so we can move the window
+    relative to the current position.
+    """
+    self._offsetx = event.x
+    self._offsety = event.y
 
+  def on_move(self, event):
+    """
+    Move the window by the mouse delta.
+    """
+    x = self.winfo_x() + (event.x - self._offsetx)
+    y = self.winfo_y() + (event.y - self._offsety)
+    self.geometry(f"+{x}+{y}")
+
+  def on_close(self):
+    """
+    Handler for the close button.
+    """
+    # I need to signal a close the same way windows or linux does
+    self.event_bus.publish("on_close")
+
+  def on_minimize(self):
+    """
+    Minimal example of how to 'iconify' (minimize) a window.
+    Note that because we used overrideredirect(True),
+    you won't see it as a typical icon on the taskbar in some OSes.
+    """
+    self.iconify()
+  
   def refresh_loop(self):
     """Start a refresh loop that runs every REFRESH_RATE_SECONDS."""
     self.refresh_groups()
@@ -207,15 +448,20 @@ class PipelineCheckerApp(tk.Tk):
 
   def on_token_enterkey(self):
     """Handler for pressing Enter in the token entry field."""
-    if self.token_var:
-      token = self.token_var.get().strip()
+    token_clean = self.token_var.get().strip()
+    util.debug(f"Trying to save token")
+    if token_clean is None or len(token_clean) == 0:
+      messagebox.showerror("Error", "Please provide a valid token.")
+      return
+
+    if util.get_env_var("GITLAB_TOKEN") != token_clean:
+      token = token_clean
       if token:
         util.debug("Token entered. Loading root group.")
         util.set_env_var('GITLAB_TOKEN', token)
         self.load_root_group()
-        return
-
-    messagebox.showerror("Error", "Please provide a valid token.")
+      else:
+        messagebox.showerror("Error", "Please provide a valid token.")
 
   def load_root_group(self):
     """Fetch the root group from GitLab and populate the tree."""
@@ -239,7 +485,7 @@ class PipelineCheckerApp(tk.Tk):
         "",
         "end",
         text=f"Group: {GROUP_NAME}",
-        values=(gid, "group", "unfetched", ""),  # (id, type, fetched-status, web_url)
+        values=(gid, "group", "unfetched", "", ""),  # (id, type, fetched-status, web_url)
         open=False
       )
       # Dummy child so we can expand
@@ -420,9 +666,12 @@ class PipelineCheckerApp(tk.Tk):
         self.tree.delete(child)
 
       old_vals = list(self.tree.item(tree_item_id, "values"))
+      node_id = old_vals[0]
       old_vals[2] = "fetched"
+      old_status = old_vals[2]
       # Mark it as 'fetched' now
       self.tree.item(tree_item_id, values=tuple(old_vals))
+      
 
       token = self.token_var.get().strip()
       util.debug("Getting subgroups.")
@@ -432,6 +681,9 @@ class PipelineCheckerApp(tk.Tk):
 
       util.debug(f"Found {len(subgroups)} subgroups and {len(projects)} projects in group {group_id}.")
 
+      group_name = self.tree.item(tree_item_id, "text").replace("Group: ", "")
+      util.debug(f"Group name: {group_name}")
+
       # --------------------------------------------------------------------
       # Insert subgroups (unmodified):
       # --------------------------------------------------------------------
@@ -440,17 +692,17 @@ class PipelineCheckerApp(tk.Tk):
         if str(sid) in IGNORED_GROUPS:
           util.debug(f"Ignoring group {sid}.")
           continue
-        sname = sg["full_name"]
+        sname = sg["full_name"].replace(f"{group_name} / ", "")
         sweb = sg.get("web_url", "")
-        node_id = self.tree.insert(
+        sub_node_id = self.tree.insert(
           tree_item_id,
           "end",
           text=f"Group: {sname}",
-          values=(sid, "group", "unfetched", sweb),
+          values=(sid, "group", "unfetched", sweb, group_name),
           open=False
         )
         # Insert a dummy child so it can be expanded
-        self.tree.insert(node_id, "end", text="Loading...")
+        self.tree.insert(sub_node_id, "end", text="Loading...")
 
       # --------------------------------------------------------------------
       # Build a list of (project, pipeline_status), then sort so failed
@@ -464,7 +716,18 @@ class PipelineCheckerApp(tk.Tk):
       for proj, pstatus, pweb, pref, pipeline in projects_with_status:
         pid = proj["id"]
         pname = proj["name"]
+        pname_clean = pname.split(" Project: ", 1)[-1].split(" (")[0].strip()
         ps_lower = pstatus.lower()
+
+        if old_status != pstatus:
+          # Fire event on change
+          self.event_bus.publish(
+            "pipeline_status_changed",
+            project_id=node_id,
+            project_name=pname_clean,
+            old_status=old_status,
+            new_status=pstatus
+          )
 
         icon = None
         tag = ""
@@ -478,7 +741,7 @@ class PipelineCheckerApp(tk.Tk):
           icon = self.skipped_img
           tag = "skipped_tag"
 
-        text = f" Project: {pname} - Pipeline: {pstatus}"
+        text = f" Project: {pname} ({pstatus})" # - Pipeline: {pstatus}
         util.debug(f"Inserting project node with text='{text}'.")
 
         self.tree.insert(
@@ -510,11 +773,12 @@ class PipelineCheckerApp(tk.Tk):
     node_type = values[1]
 
     if node_type == "project":
-      util.debug(f"Refreshing project node {node_id}.")
+      old_status = values[2]
+      util.debug(f"Refreshing project node {node_id}, old status={old_status}")
       # Build a minimal project dict so we can call our helper method
       pname = self.tree.item(item_id, "text")  
       # "Project: SomeName - Pipeline: X" => we just want "SomeName"
-      pname_clean = pname.split(" Project: ", 1)[-1].split(" - Pipeline:")[0].strip()
+      pname_clean = pname.split(" Project: ", 1)[-1].split(" (")[0].strip()
       
       project = {
         "id": node_id,
@@ -527,6 +791,16 @@ class PipelineCheckerApp(tk.Tk):
 
       token = self.token_var.get().strip()
       pstatus, pweb, pref, pipeline_id = self.get_single_project_pipeline_info(token, group_id, project)
+
+      if old_status != pstatus:
+        # Fire event on change
+        self.event_bus.publish(
+          "pipeline_status_changed",
+          project_id=node_id,
+          project_name=pname_clean,
+          old_status=old_status,
+          new_status=pstatus
+        )
 
       # Determine new icon/tag
       ps_lower = pstatus.lower()
@@ -543,7 +817,7 @@ class PipelineCheckerApp(tk.Tk):
         icon = ""
         tag = ""
 
-      new_text = f" Project: {pname_clean} - Pipeline: {pstatus}"
+      new_text = f" Project: {pname_clean} ({pstatus})"# - Pipeline: {pstatus}
 
       # Update the node
       self.tree.item(
@@ -705,7 +979,7 @@ class PipelineCheckerApp(tk.Tk):
       elif ps_lower in ("failed", "canceled"):
         icon = self.failed_img
         tags = ("fail_tag",)
-      elif ps_lower in ("skipped"):
+      elif ps_lower in ("skipped", "running", "pending"):
         icon = self.skipped_img
         tags = ("skipped_tag",)
 
@@ -749,6 +1023,11 @@ class PipelineCheckerApp(tk.Tk):
       self.refresh_group(item_id)
 
     self.loading_label.config(text="")
+
+    # Record the time we finished the refresh
+    now = time.strftime("%Y-%m-%d %I:%M:%S %p")
+    self.last_refresh_label.config(text=f"Last refresh: {now}")
+
     if save_json:
       util.execute_after_delay(0.05, self.save_tree_to_json)
 

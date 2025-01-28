@@ -57,6 +57,19 @@ def set_env_var(name, value, system=False):
   else:
     os.environ[name] = value
 
+def get_env_var(name, system=False):
+  if sys.platform.startswith("win"):
+    scope = winreg.HKEY_CURRENT_USER if not system else winreg.HKEY_LOCAL_MACHINE
+    sub_key = r'Environment'
+    with winreg.OpenKey(scope, sub_key, 0, winreg.KEY_READ) as key:
+      try:
+        value, _ = winreg.QueryValueEx(key, name)
+        return value
+      except WindowsError:
+        return None
+  else:
+    return os.environ.get(name)
+
 def get_script_name():
   script_path = sys.argv[0]
   script_name = os.path.splitext(os.path.basename(script_path))[0]

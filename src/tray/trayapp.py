@@ -13,6 +13,7 @@ class TrayAppBase:
   def __init__(self, app, icon_path="assets/images/logo"):
     # Create the Tkinter window
     self.root = app
+    self.root.event_bus.subscribe("on_close", self.on_closing)
     self.event_loop = app.event_loop or asyncio.get_event_loop()
     self.icon_path = icon_path
     self.closed = False
